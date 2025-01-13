@@ -35,20 +35,20 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 
 
 class MotionDetectorBinarySensor(BinarySensorEntity):
-    """A binary sensor that detects motion using MOG2 + contours in a background thread."""
+    """A binary sensor that detects motion using MOG2 + contours in a background thread, with debounce."""
 
     def __init__(
-        self, 
-        name, 
-        camera_source, 
-        min_area, 
-        skip_frames, 
-        width, 
-        height, 
+        self,
+        name,
+        camera_source,
+        min_area,
+        skip_frames,
+        width,
+        height,
         blur
     ):
         self._name = name
-        self._state = False  # False = no motion
+        self._state = False  # False = no motion detected
         self._camera_source = camera_source
         self._min_area = min_area
         self._skip_frames = skip_frames
@@ -56,6 +56,12 @@ class MotionDetectorBinarySensor(BinarySensorEntity):
         self._height = height
         self._blur = blur
         self._stop_thread = False
+
+        # Debounce settings:
+        self._motion_confirm_frames = 3     # number of consecutive motion frames required
+        self._no_motion_confirm_frames = 3   # number of consecutive no-motion frames required
+        self._motion_counter = 0
+        self._no_motion_counter = 0
 
         self._thread = threading.Thread(target=self._run_detection, daemon=True)
         self._thread.start()
@@ -70,22 +76,19 @@ class MotionDetectorBinarySensor(BinarySensorEntity):
         return self._state
 
     def _run_detection(self):
-        """Continuously capture frames and update motion state."""
+        """Continuously capture frames, update motion state with debounce, and (optionally) record video."""
         _LOGGER.debug("Starting _run_detection thread for camera: %s", self._camera_source)
 
         max_retries = 5
         retry_delay = 2  # seconds
         retry_count = 0
-        cool_down = 3
         cap = None
 
         while retry_count < max_retries:
             cap = cv2.VideoCapture(self._camera_source)
-            
             if cap.isOpened():
                 _LOGGER.debug("Successfully opened video source on retry %d", retry_count)
                 break
-            
             retry_count += 1
             _LOGGER.error("Failed to open video source: %s (retry %d/%d), waiting %d sec",
                           self._camera_source, retry_count, max_retries, retry_delay)
@@ -95,8 +98,8 @@ class MotionDetectorBinarySensor(BinarySensorEntity):
             _LOGGER.error("Giving up on opening video source: %s", self._camera_source)
             return
 
-        # Create MOG2 background subtractor
-        fgbg = cv2.createBackgroundSubtractorMOG2()
+        # Create MOG2 background subtractor with adjusted parameters
+        fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         frame_count = 0
 
@@ -111,48 +114,55 @@ class MotionDetectorBinarySensor(BinarySensorEntity):
 
             frame_count += 1
 
-            # Debug: Show every frame or skip
-            _LOGGER.debug("Captured frame #%d; skip_frames=%d", frame_count, self._skip_frames)
-
+            # Process only every _skip_frames-th frame
             if frame_count % self._skip_frames != 0:
-                _LOGGER.debug("Skipping frame #%d; not processing this frame.", frame_count)
                 continue
 
-            # Resize & grayscale
             frame = cv2.resize(frame, (self._width, self._height))
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            _LOGGER.debug("Frame #%d resized to %dx%d and converted to grayscale.", 
-                          frame_count, self._width, self._height)
+            _LOGGER.debug("Frame #%d resized to %dx%d and converted to grayscale.", frame_count, self._width, self._height)
 
             if self._blur:
-                gray = cv2.GaussianBlur(gray, (21, 21), 0)
+                # Increase blur kernel size if needed to reduce noise
+                gray = cv2.GaussianBlur(gray, (31, 31), 0)
                 _LOGGER.debug("Applied GaussianBlur to frame #%d.", frame_count)
 
             # Background subtraction
             fgmask = fgbg.apply(gray)
 
-            # Morphology to reduce noise
+            # Morphological operations to reduce noise
             fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)
             fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_DILATE, kernel)
 
-            # Find contours & filter by area
+            # Find contours and determine if there is significant motion
             contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             has_motion = any(cv2.contourArea(c) >= self._min_area for c in contours)
+            _LOGGER.debug("Frame #%d: Found %d contours; has_motion=%s (min_area=%d)",
+                          frame_count, len(contours), has_motion, self._min_area)
 
-            _LOGGER.debug(
-                "Frame #%d: Found %d contours; has_motion=%s (min_area=%d)",
-                frame_count,
-                len(contours),
-                has_motion,
-                self._min_area
-            )
+            # Implement debounce logic:
+            if has_motion:
+                self._motion_counter += 1
+                self._no_motion_counter = 0
+            else:
+                self._no_motion_counter += 1
+                self._motion_counter = 0
 
-            # Update internal state if changed
-            if has_motion != self._state:
-                self._state = has_motion
-                _LOGGER.debug("Motion state changed to %s on frame #%d", self._state, frame_count)
+            # Update sensor state only if threshold is reached
+            if not self._state and self._motion_counter >= self._motion_confirm_frames:
+                _LOGGER.debug("Debounce: Confirmed motion for %d frames, setting state ON", self._motion_counter)
+                self._state = True
                 self.schedule_update_ha_state()
-                time.sleep(cool_down)
+                self._motion_counter = 0
+
+            if self._state and self._no_motion_counter >= self._no_motion_confirm_frames:
+                _LOGGER.debug("Debounce: Confirmed no motion for %d frames, setting state OFF", self._no_motion_counter)
+                self._state = False
+                self.schedule_update_ha_state()
+                self._no_motion_counter = 0
+
+            # Small sleep to reduce CPU usage
+            time.sleep(0.01)
 
         _LOGGER.debug("Exiting _run_detection thread for camera: %s", self._camera_source)
         cap.release()
@@ -171,5 +181,4 @@ class MotionDetectorBinarySensor(BinarySensorEntity):
         self.stop_motion_detection()
         # Wait in a background thread so we don’t block event loop
         await self.hass.async_add_executor_job(self._thread.join)
-
 
