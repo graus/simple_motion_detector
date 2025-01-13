@@ -1,0 +1,12 @@
+{
+  "domain": "simple_motion_detector",
+  "name": "Motion Detector",
+  "documentation": "https://github.com/graus/simple_motion_detector/README.md",
+  "requirements": [
+    "opencv-python-headless==4.*"
+  ],
+  "codeowners": [
+    "@graus"
+  ],
+  "version": "0.1"
+}
